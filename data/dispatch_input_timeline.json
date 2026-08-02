@@ -1,0 +1,102 @@
+{
+  "_meta": {
+    "description": "DRT 배차 모듈 입력용 — 시간 순서대로 발생하는 요청 시퀀스 타임라인",
+    "target_area": "서울 종로구 (종로구청 인근)",
+    "simulation_date": "2025-07-10",
+    "note": "오케스트레이터가 LLM 출력을 정제하여 배차 모듈로 넘겨주는 최종 입력 데이터 포맷입니다."
+  },
+
+  "locations": {
+    "jongno_gu_office": { "name": "종로구청", "lat": 37.5730, "lng": 126.9794 },
+    "jongno_senior_center_main": { "name": "종로노인종합복지관 본관", "lat": 37.5824, "lng": 127.0024 },
+    "seoul_senior_welfare_center": { "name": "서울노인복지센터", "lat": 37.5705, "lng": 126.9849 },
+    "hyehwa_station": { "name": "혜화역", "lat": 37.5824, "lng": 127.0019 },
+    "jongno3ga_station": { "name": "종로3가역", "lat": 37.5703, "lng": 126.9919 },
+    "seoul_univ_hospital": { "name": "서울대학교병원", "lat": 37.5797, "lng": 126.9966 },
+    "kyunghee_oriental_hospital": { "name": "경희대학교 한방병원", "lat": 37.5926, "lng": 127.0517 },
+    "tapgol_park": { "name": "탑골공원", "lat": 37.5712, "lng": 126.9883 },
+    "dongmyo_station": { "name": "동묘앞역", "lat": 37.5726, "lng": 127.0166 },
+    "gyeongbokgung_station": { "name": "경복궁역", "lat": 37.5759, "lng": 126.9733 }
+  },
+
+  "vehicles_initial_state_at_09_00": [
+    { "vehicle_id": "DRT-01", 
+      "current_location": "jongno3ga_station", 
+      "capacity_total": 4, 
+      "capacity_used": 0, 
+      "scheduled_reservations": [] },
+      
+    { "vehicle_id": "DRT-02",
+      "current_location": "hyehwa_station",
+      "capacity_total": 4,
+      "capacity_used": 0,
+      "scheduled_reservations": [] },
+
+    { "vehicle_id": "DRT-03",
+      "current_location": "gyeongbokgung_station", 
+      "capacity_total": 4, 
+      "capacity_used": 0, 
+      "scheduled_reservations": [] }
+  ],
+
+  "event_timeline": [
+    {
+      "seq": 1, "event_time": "09:30", "event_type": "new_request", "request_id": "req_001",
+      "payload": { "requested_date": "2025-07-11", "pickup": "jongno3ga_station", "dropoff": "jongno_gu_office", "requested_pickup_time": "10:00", "passenger_count": 1 }
+    },
+    {
+      "seq": 2, "event_time": "09:35", "event_type": "new_request", "request_id": "req_002",
+      "payload": { "requested_date": "2025-07-11", "pickup": "gyeongbokgung_station", "dropoff": "jongno_gu_office", "requested_pickup_time": "09:50", "passenger_count": 1 }
+    },
+    {
+      "seq": 3, "event_time": "09:36", "event_type": "new_request", "request_id": "req_003",
+      "payload": { "requested_date": "2025-07-11", "pickup": "gyeongbokgung_station", "dropoff": "jongno_gu_office", "requested_pickup_time": "09:50", "passenger_count": 1 }
+    },
+    {
+      "seq": 4, "event_time": "09:40", "event_type": "new_request", "request_id": "req_004",
+      "payload": { "requested_date": "2025-07-11", "pickup": "tapgol_park", "dropoff": "seoul_senior_welfare_center", "requested_pickup_time": "10:10", "passenger_count": 1 }
+    },
+    {
+      "seq": 5, "event_time": "09:45", "event_type": "new_request", "request_id": "req_005",
+      "payload": { "requested_date": "2025-07-11", "pickup": "jongno_senior_center_main", "dropoff": "seoul_univ_hospital", "requested_pickup_time": "10:00", "passenger_count": 1 }
+    },
+    {
+      "seq": 6, "event_time": "09:55", "event_type": "new_request", "request_id": "req_006",
+      "payload": { "requested_date": "2025-07-11", "pickup": "dongmyo_station", "dropoff": "hyehwa_station", "requested_pickup_time": "10:08", "passenger_count": 1 }
+    },
+    {
+      "seq": 7, "event_time": "10:02", "event_type": "new_request", "request_id": "req_007",
+      "payload": { "requested_date": "2025-07-11", "pickup": "jongno3ga_station", "dropoff": "gyeongbokgung_station", "requested_pickup_time": "10:30", "passenger_count": 1 }
+    },
+    {
+      "seq": 8, "event_time": "10:04", "event_type": "cancellation", "target_reservation_id": "req_002"
+    },
+    {
+      "seq": 9, "event_time": "10:06", "event_type": "new_request", "request_id": "req_008",
+      "payload": { "requested_date": "2025-07-11", "pickup": "gyeongbokgung_station", "dropoff": "tapgol_park", "requested_pickup_time": "10:06", "passenger_count": 1 }
+    },
+    {
+      "seq": 10, "event_time": "10:09", "event_type": "new_request", "request_id": "req_009",
+      "payload": { "requested_date": "2025-07-11", "pickup": "seoul_senior_welfare_center", "dropoff": "jongno_gu_office", "requested_pickup_time": "10:03", "passenger_count": 2 }
+    },
+    {
+      "seq": 11, "event_time": "10:15", "event_type": "change_request", "target_reservation_id": "req_005",
+      "payload": { "new_requested_date": "2025-07-11", "new_requested_pickup_time": "11:30", "passenger_count": 1 }
+    },
+    {
+      "seq": 12, "event_time": "10:20", "event_type": "new_request", "request_id": "req_010",
+      "payload": { "requested_date": "2025-07-11", "pickup": "jongno_gu_office", "dropoff": "kyunghee_oriental_hospital", "requested_pickup_time": "10:50", "passenger_count": 1 }
+    },
+    {
+      "seq": 13, "event_time": "10:25", "event_type": "new_request", "request_id": "req_011",
+      "payload": { "requested_date": "2025-07-11", "pickup": "tapgol_park", "dropoff": "jongno_gu_office", "requested_pickup_time": "10:45", "passenger_count": 1 }
+    },
+    {
+      "seq": 14, "event_time": "10:26", "event_type": "new_request", "request_id": "req_012",
+      "payload": { "requested_date": "2025-07-11", "pickup": "tapgol_park", "dropoff": "seoul_univ_hospital", "requested_pickup_time": "10:46", "passenger_count": 1 }
+    },
+    {
+      "seq": 15, "event_time": "10:40", "event_type": "cancellation", "target_reservation_id": "req_004"
+    }
+  ]
+}
