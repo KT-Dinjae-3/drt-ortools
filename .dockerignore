@@ -1,0 +1,8 @@
+.git
+tests/
+data/
+__pycache__/
+*.pyc
+.gitignore
+README.md
+BE_INTEGRATION_DISCUSSION.md

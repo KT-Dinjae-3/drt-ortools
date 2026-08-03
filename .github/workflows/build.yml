@@ -1,0 +1,69 @@
+# Single-arch build for the OR-Tools dispatch service (arm64 only — the only
+# deploy target is the OCI Ampere k3s node). Builds and pushes the image by
+# tag, then pins deploy/k3s/ortools.yaml to the built digest and commits, so
+# ArgoCD auto-syncs the rollout.
+name: build-ortools
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dispatch/**'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/kt-dinjae-3/drt-ortools
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=dev
+            type=sha,format=short
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Pin ortools image to built digest and commit
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          sed -i -E "s#(image: ghcr\.io/kt-dinjae-3/drt-ortools)(:[^@ ]+|@sha256:[0-9a-f]+)?#\1@${DIGEST}#" deploy/k3s/ortools.yaml
+          if git diff --quiet -- deploy/k3s/ortools.yaml; then
+            echo "ortools image already at ${DIGEST}, nothing to commit"
+            exit 0
+          fi
+          git config user.name "고태규"
+          git config user.email "taekueko714@hufs.ac.kr"
+          git add deploy/k3s/ortools.yaml
+          git commit -m "deploy: pin ortools to ${DIGEST} [skip ci]"
+          git push origin main

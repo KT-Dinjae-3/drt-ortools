@@ -1,0 +1,45 @@
+# OR-Tools DRT dispatch engine (서산시 행복택시). Runs in-cluster so the
+# backend (vss, same namespace) reaches it via plain ClusterIP DNS instead of
+# the Tailscale tunnel used for the AI NLU service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ortools
+  namespace: drt
+  labels: { app: ortools }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ortools }
+  template:
+    metadata:
+      labels: { app: ortools }
+    spec:
+      # Reuses the same ghcr-pull secret already created in the drt
+      # namespace for vss (same registry, same namespace).
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: ortools
+          image: ghcr.io/kt-dinjae-3/drt-ortools:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8092 }
+          readinessProbe:
+            httpGet: { path: /health, port: 8092 }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ortools
+  namespace: drt
+  labels: { app: ortools }
+spec:
+  selector: { app: ortools }
+  ports:
+    - { name: http, port: 8092, targetPort: 8092 }
