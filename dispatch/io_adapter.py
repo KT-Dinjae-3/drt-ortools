@@ -5,7 +5,7 @@ dispatch/io_adapter.py -- 파이프라인 I/O 변환 계층
 
 팀 기준 JSON 포맷:
   - 입력: dispatch_input_timeline.json
-    - 위치 참조: 키 문자열 (예: "jongno3ga_station")
+    - 위치 참조: 키 문자열 (예: "seosan_bus_terminal")
     - event_time: "HH:MM" 포맷
     - vehicles_initial_state_at_09_00 배열
   - 출력: dispatch_output_answer.json
@@ -14,7 +14,7 @@ dispatch/io_adapter.py -- 파이프라인 I/O 변환 계층
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from .models import (
     DispatchEvent,
@@ -24,7 +24,7 @@ from .models import (
     Vehicle,
     time_str_to_minutes,
 )
-from .locations import get_location, resolve_location_name, load_locations_from_json
+from .locations import get_location, load_locations_from_json
 
 
 class DispatchIOAdapter:
@@ -76,8 +76,8 @@ class DispatchIOAdapter:
                 "event_type": "new_request",
                 "request_id": "req_001",
                 "payload": {
-                    "pickup": "jongno3ga_station",
-                    "dropoff": "jongno_gu_office",
+                    "pickup": "seosan_bus_terminal",
+                    "dropoff": "seosan_city_hall",
                     "requested_pickup_time": "10:00",
                     "passenger_count": 1
                 }
@@ -107,8 +107,8 @@ class DispatchIOAdapter:
         팀 기준 포맷::
 
             {
-                "vehicle_id": "DRT-01",
-                "current_location": "jongno3ga_station",
+                "vehicle_id": "DRT-SS-01",
+                "current_location": "seosan_city_hall",
                 "capacity_total": 4,
                 "capacity_used": 0,
                 "scheduled_reservations": []
@@ -120,7 +120,9 @@ class DispatchIOAdapter:
             loc_key = v.get("current_location", "")
             loc = get_location(loc_key) if loc_key else None
             if loc is None:
-                loc = Location(0.0, 0.0, loc_key)
+                raise ValueError(
+                    f"unknown vehicle current_location: {loc_key or '<empty>'}"
+                )
 
             vehicles.append(Vehicle(
                 vehicle_id=v["vehicle_id"],
@@ -133,7 +135,7 @@ class DispatchIOAdapter:
     def parse_payload_locations(self, payload: Dict[str, Any]):
         """
         payload에서 pickup/dropoff Location을 추출한다.
-        팀 기준: 위치가 키 문자열 (예: "jongno3ga_station")
+        팀 기준: 위치가 키 문자열 (예: "seosan_bus_terminal")
 
         Returns
         -------
@@ -146,7 +148,7 @@ class DispatchIOAdapter:
         if isinstance(pickup_key, str):
             pickup_loc = get_location(pickup_key)
             if pickup_loc is None:
-                pickup_loc = Location(0.0, 0.0, pickup_key)
+                raise ValueError(f"unknown pickup location: {pickup_key or '<empty>'}")
         elif isinstance(pickup_key, dict):
             # 폴백: 기존 dict 형식도 지원
             pickup_loc = Location.from_dict(pickup_key)
@@ -156,7 +158,7 @@ class DispatchIOAdapter:
         if isinstance(dropoff_key, str):
             dropoff_loc = get_location(dropoff_key)
             if dropoff_loc is None:
-                dropoff_loc = Location(0.0, 0.0, dropoff_key)
+                raise ValueError(f"unknown dropoff location: {dropoff_key or '<empty>'}")
         elif isinstance(dropoff_key, dict):
             dropoff_loc = Location.from_dict(dropoff_key)
         else:
@@ -183,10 +185,10 @@ class DispatchIOAdapter:
                 "session_id": "sess_001",
                 "status": "success",
                 "action": "new_reservation",
-                "vehicle_id": "DRT-01",
+                "vehicle_id": "DRT-SS-01",
                 "pickup_time": "10:00",
-                "pickup_location": "종로3가역",
-                "dropoff_location": "종로구청",
+                "pickup_location": "서산버스터미널",
+                "dropoff_location": "서산시청",
                 "reasoning": ["..."]
             }
         """

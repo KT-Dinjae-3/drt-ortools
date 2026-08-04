@@ -89,10 +89,10 @@ flowchart TB
   "session_id": "sess_001",
   "status": "success",
   "action": "new_reservation",
-  "vehicle_id": "DRT-1004",
+  "vehicle_id": "DRT-SS-01",
   "pickup_time": "15:00",
-  "pickup_location": "수원역",
-  "dropoff_location": "판교역"
+  "pickup_location": "서산버스터미널",
+  "dropoff_location": "서산의료원"
 }
 ```
 
@@ -104,23 +104,29 @@ flowchart TB
 from dispatch import DynamicDRTDispatcher, DispatchIOAdapter
 from dispatch.models import Vehicle, Location
 
-# 1. 어댑터 및 배차 엔진 초기화
+# 1. 어댑터 및 서산시 차량 초기화
 adapter = DispatchIOAdapter()
-dispatcher = DynamicDRTDispatcher()
-
-# 2. 초기 차량 등록
-dispatcher.register_vehicle(
-    Vehicle(vehicle_id="DRT-1004", capacity=4, current_location=Location(37.2636, 127.0001, "depot"), is_active=True)
+depot = Location(36.7845, 126.4501, "서산시청 차고지")
+dispatcher = DynamicDRTDispatcher(
+    vehicles=[
+        Vehicle(
+            vehicle_id="DRT-SS-01",
+            capacity=4,
+            current_location=depot,
+            is_active=True,
+        )
+    ],
+    depot=depot,
 )
 
-# 3. 요청 이벤트 파싱 및 처리
+# 2. 요청 이벤트 파싱 및 처리
 raw_event = {
     "seq": 1,
     "event_type": "new_request",
     "event_time": "14:30",
     "payload": {
-        "pickup": "수원역",
-        "dropoff": "판교역",
+        "pickup": "seosan_bus_terminal",
+        "dropoff": "seosan_medical_center",
         "requested_pickup_time": "15:00",
         "passenger_count": 2
     }
@@ -129,7 +135,7 @@ raw_event = {
 event = adapter.parse_event(raw_event)
 result = dispatcher.process_event(event)
 
-# 4. 결과 출력
+# 3. 결과 출력
 print(adapter.build_output(result))
 ```
 

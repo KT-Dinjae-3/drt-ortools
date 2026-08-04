@@ -1,230 +1,197 @@
-# OR-Tools 배차 서비스 ↔ BE 연동 협의안
+# drt-call-backend ↔ OR-Tools 연동 협의서 (BE 우선)
 
-## 1. 문서 목적
+> 검토 기준: `KT-Dinjae-3/drt-call-backend`의 최신 `origin/main@2169e7b`
+>
+> 검토일: 2026-08-04
+>
+> 수정 범위: `LEG/ORtools`만. BE, AI, `deploy/k3s/ortools.yaml`은 수정하지 않는다.
 
-이 문서는 OR-Tools 기반 DRT 배차 서비스와 원격 BE(Voice Session Server 포함)를
-Tailscale 네트워크로 연동하기 전에 양 팀이 합의해야 할 API 계약과 책임 범위를
-정리한 자료입니다.
+## 1. 결론
 
-현재 OR-Tools 서비스는 B200 서버에서 FastAPI로 실행하며, 원격 BE가 Tailscale
-주소를 통해 호출하는 구성을 전제로 합니다.
+OR-Tools가 맞춰야 할 계약은 BE가 외부로 노출하는 Mock DRT API가 아니라
+`internal/ortoolsclient/client.go`의 provider 계약이다.
 
----
+최신 BE에는 OR-Tools 전용 HTTP client와 adapter가 이미 구현되어 있다. 따라서
+현재 OR-Tools의 평면형 JSON 계약을 유지해야 한다. BE의 다른 API에서 사용하는
+중첩 `vehicle` 객체나 BE 전체 예약 객체를 OR 응답에 강제로 적용하면 9002 연동이
+깨진다.
 
-## 2. 제안 아키텍처
+현재 역할은 다음과 같다.
 
-```text
-사용자 전화
-  → 원격 BE / Voice Session Server
-      - 통화 세션 관리
-      - 사용자 정보 및 대화 상태 관리
-      - 예약 데이터 영속화
-      - OR-Tools API 호출 및 재시도
-          ↓ Tailscale HTTP
-      OR-Tools 배차 서비스
-      - 차량 및 운행 경로 상태 관리
-      - 시간창·정원·승하차 순서 제약 검증
-      - 최적 차량 및 경로 결정
-      - 배차 결과 반환
-```
+- AI는 사용자와 대화하며 출발지, 목적지, 희망 시각, 인원 등을 수집한다.
+- BE는 통화 상태, 사용자용 예약번호, PostgreSQL 예약 원본, 멱등성 및 OR 호출을
+  소유한다.
+- OR-Tools는 차량·경로 상태와 배차 계산을 소유하고 provider용 ID를 반환한다.
+- AI가 OR-Tools를 직접 호출하지 않는다.
+- BE의 예약 조회는 OR 목록 API가 아니라 BE 데이터베이스에서 수행한다.
 
-### 권장 책임 분리
-
-| 구분 | BE | OR-Tools |
-|---|---|---|
-| 전화 및 대화 세션 | 소유 | 미관여 |
-| 승객·전화번호 등 개인정보 | 소유 | 배차에 필요한 최소 정보만 사용 |
-| 예약 업무 상태 | 원본(Source of Truth) | 배차 상태 참조 |
-| 예약 ID | 생성·소유 권장 | 요청과 연결해 보관 |
-| 차량·경로 최적화 상태 | 조회·표시 | 소유 |
-| 배차 가능성 검증 | 요청 | 계산 |
-| 차량 선택 및 경로 생성 | 결과 사용 | 수행 |
-| 요청 재시도 | 수행 | 멱등 처리 |
-| 예약·통화 DB | 소유 | 필요 시 배차 상태 스냅샷 보관 |
-
----
-
-## 3. OR-Tools 담당 범위
-
-OR-Tools 측에서 독립적으로 구현할 수 있는 항목입니다.
-
-- 차량 정원 제약
-- 픽업 후 하차 순서 제약
-- 픽업 시간창 및 서비스 운영시간 검증
-- 기존 승객의 최대 우회시간·지연 한도 검증
-- 신규 요청의 최적 차량 및 경로 삽입 위치 계산
-- 동시 배차 요청에 대한 상태 잠금 또는 직렬화
-- 알 수 없는 위치 및 잘못된 입력 거절
-- 존재하지 않는 예약에 대한 안전한 취소 실패 처리
-- 배차 알고리즘 단위·통합·동시성 테스트
-- 구조화된 오류 코드와 계산 근거 반환
-
----
-
-## 4. BE와 반드시 합의할 사항
-
-### 4.1 ID 소유권
-
-결정이 필요한 ID:
-
-- `reservation_id`: 사용자에게 안내하고 BE DB에 저장하는 업무 예약 ID
-- `dispatch_id`: OR-Tools 내부 배차·경로 ID
-- `client_ref`: BE 요청의 멱등성 키
-- `session_id`: 전화 통화 세션 ID
-
-권장안:
-
-- BE가 `reservation_id`를 생성하고 원본으로 관리합니다.
-- OR-Tools는 별도 `dispatch_id`를 생성합니다.
-- BE는 매 예약 작업마다 고유한 `client_ref`를 보냅니다.
-- 전화 재연결이나 후속 요청에 `session_id`를 예약 식별자로 사용하지 않습니다.
-
-합의 질문:
-
-1. `reservation_id`는 BE와 OR-Tools 중 누가 생성합니까?
-2. `client_ref`는 예약 단위입니까, API 호출 단위입니까?
-3. 예약 변경 후에도 같은 `reservation_id`를 유지합니까?
-
-### 4.2 멱등성과 재시도
-
-Tailscale 연결 지연이나 타임아웃 때문에 BE가 같은 요청을 재전송할 수 있습니다.
-따라서 동일한 `client_ref`로 같은 예약 생성 요청이 들어오면 중복 배차하지 않고
-처음 생성된 결과를 반환해야 합니다.
-
-합의 질문:
-
-1. BE의 기본 타임아웃은 몇 초입니까?
-2. 최대 재시도 횟수와 간격은 얼마입니까?
-3. 동일 `client_ref`에 다른 요청 내용이 오면 `409 Conflict`로 처리할까요?
-4. 멱등성 기록을 얼마 동안 유지할까요?
-
-### 4.3 Availability와 예약 확정
-
-선택 가능한 방식:
-
-#### A. 조회 후 확정
+## 2. 실제 호출 구조
 
 ```text
-availability/check → 사용자 확인 → reservations 생성
+AI module
+  │ 대화 분석/음성 응답
+  ▼
+drt-call-backend voice-session-server
+  │ ortoolsAdapter
+  │ internal/ortoolsclient
+  │ ORTOOLS_BASE_URL / ORTOOLS_TIMEOUT
+  ▼
+Tailscale 내부망
+  ▼
+OR-Tools HTTP service :8092
+  ├─ GET  /health
+  ├─ POST /drt/availability/check
+  ├─ POST /drt/reservations
+  └─ POST /drt/reservations/cancel
 ```
 
-조회와 확정 사이에 다른 요청이 들어오면 차량 상태가 바뀔 수 있습니다.
-Availability 결과는 확정을 보장하지 않는다는 점이 필요합니다.
+최신 BE에서 OR 경로는 현재 K3s 내선 `9002`의 `dispatch=ortools` canary에만
+연결되어 있다. 내선 `9000`은 동일한 경로가 아니다.
 
-#### B. 한 번에 검증 및 확정 — 권장
+## 3. 시스템별 소유권
 
-```text
-reservations 생성 요청 → OR-Tools가 원자적으로 검증·배정
+| 항목 | AI | BE | OR-Tools |
+|---|---|---|---|
+| 사용자 발화·슬롯 수집 | 소유 | 수신·검증 | 미관여 |
+| 통화 세션·도구 실행 상태 | 보조 | 소유 | 미관여 |
+| 사용자용 예약번호 | 읽어서 안내 | 소유 | 외부 provider ID만 생성 |
+| 예약 원본·조회·취소 상태 | 미관여 | PostgreSQL 원본 | 배차 요청 상태 참조 |
+| 외부 호출 멱등성 | 미관여 | 소유 | `client_ref` 멱등성은 아직 없음 |
+| 차량·경로·시간창·정원 | 미관여 | 결과 사용 | 소유 |
+| 정류장 원장·좌표·통합ID | 이름 수집 | 조회·보존 필요 | 현재 원장 소유 |
+| 자유문장 POI 지오코딩 | 표현 수집 | 지도/정책 계층 소유 권장 | 미관여 |
+| Tailscale URL·timeout·배포 | 미관여 | 설정 소유 | 서비스 제공 |
+
+## 4. 최신 BE가 실제로 호출하는 API
+
+### 4.1 Health
+
+`GET /health`
+
+BE는 응답 본문의 상세 필드를 해석하지 않고 HTTP `2xx` 여부만 확인한다.
+
+현재 OR 응답 예:
+
+```json
+{
+  "status": "ok",
+  "service": "seosan-drt-ortools",
+  "active_vehicles": 3,
+  "total_stops": 589
+}
 ```
 
-경쟁 상태가 적고 구현이 단순합니다. 사용자 최종 확인 전 단순 안내가 필요하다면
-availability는 참고 정보만 반환하고 차량을 홀드하지 않는 방식이 적합합니다.
+### 4.2 Availability
 
-합의 질문:
+`POST /drt/availability/check`
 
-1. Availability 호출이 차량을 홀드합니까?
-2. 홀드한다면 만료 시간과 `hold_id`가 필요합니까?
-3. 조회 성공 후 확정 실패가 가능한 것을 BE가 처리할 수 있습니까?
+최신 BE 요청:
 
-### 4.4 상태의 원본과 재시작 복구
+```json
+{
+  "region_code": "SEOSAN_CITY",
+  "origin": "서산시청",
+  "destination": "서산의료원",
+  "requested_pickup_at": "2026-08-04T13:56:00+09:00",
+  "passenger_count": 1
+}
+```
 
-권장안:
+가용 시 필수 응답:
 
-- 예약의 업무 상태와 승객 정보는 BE DB가 원본입니다.
-- OR-Tools는 현재 차량 위치, 탑승 인원, 활성 스톱과 경로를 관리합니다.
-- OR-Tools 재시작 시 BE가 활성 예약과 차량 상태를 다시 전송하거나,
-  OR-Tools가 자체 스냅샷·이벤트 로그로 복구합니다.
+```json
+{
+  "status": "success",
+  "available": true,
+  "estimated_pickup_time": "14:01",
+  "vehicle_id": "DRT-SS-01"
+}
+```
 
-합의 질문:
+`estimated_pickup_time`은 `HH:MM` 또는 RFC 3339가 가능하다. `available=true`이면
+`estimated_pickup_time`과 `vehicle_id`가 모두 있어야 한다.
 
-1. 차량 위치와 운행 상태는 어느 시스템이 공급합니까?
-2. OR-Tools 재시작 시 활성 예약을 어떻게 복원합니까?
-3. BE와 OR-Tools 상태가 다르면 어느 쪽을 기준으로 조정합니까?
-4. 완료·노쇼·차량 고장 이벤트는 어떤 시스템이 발생시킵니까?
+배차 불가 표현은 두 가지를 BE가 처리할 수 있다.
 
-### 4.5 날짜와 시간
+```json
+{
+  "status": "success",
+  "available": false,
+  "reason_code": "NO_VEHICLE_AVAILABLE",
+  "reason": "배차 가능한 차량이 없습니다."
+}
+```
 
-현재처럼 `HH:MM`만 사용하면 오늘과 내일 예약을 구분할 수 없습니다.
-
-권장안:
-
-- 모든 외부 API 시간은 ISO 8601 형식을 사용합니다.
-- 예: `2026-07-30T10:00:00+09:00`
-- 서비스 기준 타임존은 `Asia/Seoul`로 고정합니다.
-- OR-Tools 내부 계산은 날짜가 포함된 절대 시각 또는 명시적 service date를 사용합니다.
-
-합의 질문:
-
-1. 과거 요청 판단의 기준 시각은 BE와 OR-Tools 중 어디의 시계입니까?
-2. 당일·익일 예약 허용 범위는 어떻게 됩니까?
-3. 운영시간 경계와 휴무일 정책은 누가 관리합니까?
-
-### 4.6 취소와 변경
-
-취소 요청은 정확한 `reservation_id` 또는 `dispatch_id`로만 처리해야 합니다.
-예약을 찾지 못했을 때 최근 예약을 대신 취소하는 동작은 허용하지 않습니다.
-
-합의 질문:
-
-1. 변경을 기존 예약 수정으로 처리합니까, 취소 후 신규 예약으로 처리합니까?
-2. 승차 임박 시 취소·변경 제한이 있습니까?
-3. 이미 완료·취소된 예약에 대한 재요청 응답은 어떻게 합니까?
-4. 부분 변경 시 어떤 필드를 보낼지, 전체 예약 스냅샷을 보낼지 결정해야 합니다.
-
-### 4.7 오류와 HTTP 상태 코드
-
-권장 예시:
-
-| HTTP | 오류 코드 | 의미 |
-|---:|---|---|
-| 400 | `INVALID_REQUEST` | 형식 또는 필수값 오류 |
-| 404 | `RESERVATION_NOT_FOUND` | 예약 없음 |
-| 409 | `IDEMPOTENCY_CONFLICT` | 같은 키에 다른 요청 |
-| 409 | `STATE_CONFLICT` | 취소·완료 등 상태 충돌 |
-| 422 | `DISPATCH_UNAVAILABLE` | 제약조건상 배차 불가 |
-| 422 | `OUT_OF_SERVICE_HOURS` | 운행시간 외 |
-| 422 | `UNSUPPORTED_LOCATION` | 지원하지 않는 위치 |
-| 503 | `SOLVER_UNAVAILABLE` | 엔진 초기화·내부 상태 장애 |
-| 504 | `SOLVER_TIMEOUT` | 제한시간 내 해를 찾지 못함 |
-
-오류 응답 권장 형식:
+또는 오류 코드가 포함된 HTTP `4xx` 응답:
 
 ```json
 {
   "error": {
-    "code": "DISPATCH_UNAVAILABLE",
-    "message": "해당 시간에는 배차 가능한 차량이 없습니다.",
-    "retryable": false,
-    "request_id": "req-123"
+    "code": "CAPACITY_EXCEEDED",
+    "message": "이용 가능한 차량이 없습니다."
   }
 }
 ```
 
----
+Availability는 차량을 홀드하지 않는다. 현재 OR 구현도 최근접 활성 차량과 좌석을
+기준으로 예상 시각을 계산하는 사전 확인이므로, 예약 생성 결과와 항상 동일하다고
+보장하지 않는다.
 
-## 5. API 계약 초안
-
-### 5.1 예약 및 배차 확정
+### 4.3 예약 생성
 
 `POST /drt/reservations`
 
+최신 BE 요청:
+
 ```json
 {
-  "request_id": "req-123",
-  "client_ref": "reserve:call-abc:turn-7",
-  "reservation_id": "R-20260730-0001",
-  "session_id": "call-abc",
-  "region_code": "SEOSAN_CITY",
-  "origin": {
-    "location_id": "emam_town_hall",
-    "name": "음암면 마을회관"
-  },
-  "destination": {
-    "location_id": "seosan_medical_center",
-    "name": "서산의료원"
-  },
-  "requested_pickup_at": "2026-07-30T10:00:00+09:00",
-  "passenger_count": 2
+  "client_ref": "call-session-id",
+  "passenger_phone": "01012345678",
+  "origin": "서산시청",
+  "destination": "서산의료원",
+  "requested_pickup_at": "2026-08-04T13:56:00+09:00",
+  "passenger_count": 1,
+  "region_code": "SEOSAN_CITY"
+}
+```
+
+BE가 검사하는 성공 응답:
+
+```json
+{
+  "status": "success",
+  "reservation_id": "R-20260804-0001",
+  "input_ref": "req_001",
+  "vehicle_id": "DRT-SS-01",
+  "pickup_time": "14:01",
+  "pickup_location": "서산시청",
+  "dropoff_location": "서산의료원"
+}
+```
+
+필수 조건:
+
+- HTTP 상태는 `2xx`여야 한다.
+- `status`는 정확히 `success`여야 한다.
+- `reservation_id`, `vehicle_id`, `pickup_time`은 비어 있으면 안 된다.
+- `input_ref`는 정규식 `^req_[0-9]{3,}$`를 만족해야 한다.
+- `pickup_location`과 `dropoff_location`은 선택 필드이며, 없으면 BE가 요청값을
+  사용한다.
+- 정류장 ID, 권역 등 추가 필드는 BE가 무시하므로 하위 호환 방식으로 제공할 수 있다.
+
+`client_ref`는 현재 OR에서 멱등 키로 보장되지 않는다. 최신 BE도 이 때문에 예약 생성
+HTTP 요청을 자동 재시도하지 않는다.
+
+### 4.4 예약 취소
+
+`POST /drt/reservations/cancel`
+
+BE는 사용자용 예약번호가 아니라 OR 예약 생성 응답의 `input_ref`를 보낸다.
+
+```json
+{
+  "target_reservation_id": "req_001",
+  "reason": "이용자 전화 취소"
 }
 ```
 
@@ -232,99 +199,231 @@ availability는 참고 정보만 반환하고 차량을 홀드하지 않는 방�
 
 ```json
 {
-  "status": "confirmed",
-  "reservation_id": "R-20260730-0001",
-  "dispatch_id": "D-20260730-0042",
-  "vehicle": {
-    "vehicle_id": "DRT-SS-01",
-    "label": "1호차"
-  },
-  "assigned_pickup_at": "2026-07-30T10:05:00+09:00",
-  "estimated_dropoff_at": "2026-07-30T10:27:00+09:00",
-  "shared_ride": true
+  "status": "success",
+  "action": "cancellation",
+  "cancelled_reservation_id": "req_001"
 }
 ```
 
-### 5.2 예약 취소
+`cancelled_reservation_id` 또는 `input_ref` 중 하나가 요청한 `req_001`과 정확히
+같아야 한다. 존재하지 않는 ID를 부분 일치시키거나 마지막 예약으로 대체하면 안 된다.
+이미 취소된 요청도 다시 성공으로 처리하지 않고 `ALREADY_CANCELLED`로 실패시킨다.
 
-`POST /drt/reservations/{reservation_id}/cancel`
+### 4.5 BE가 OR에 호출하지 않는 API
 
-```json
-{
-  "request_id": "req-124",
-  "client_ref": "cancel:R-20260730-0001",
-  "reason": "PASSENGER_REQUEST"
-}
-```
+현재 최신 BE adapter는 다음 OR API를 호출하지 않는다.
 
-### 5.3 예약 변경
+- `GET /drt/reservations`
+- `PATCH /drt/reservations/{reservation_id}/cancel`
+- `GET /drt/regions`
+- 정류장 검색·상세·가까운 정류장 API
 
-`POST /drt/reservations/{reservation_id}/change`
+이 API들은 운영·디버깅 및 향후 정류장 연동용 추가 기능이다. 현재 9002 계약을
+바꾸는 근거로 사용하지 않는다.
 
-변경 방식은 BE와 합의가 필요합니다. 전체 요청 스냅샷을 보내고 OR-Tools가 기존
-경로에서 제거한 뒤 새 조건을 원자적으로 검증하는 방식을 권장합니다.
+## 5. 예약 ID 매핑
 
-### 5.4 상태 동기화
+이름이 비슷해도 세 ID의 소유권은 다르다.
 
-OR-Tools 재시작 복구를 BE 주도로 한다면 다음과 같은 내부 API 또는 시작 시 동기화
-절차가 필요합니다.
+| BE 저장 필드 | 값 예 | 의미 |
+|---|---|---|
+| `reservation_id` | `R-20260804-0007` | BE가 만든 사용자용 canonical 예약번호 |
+| `dispatch_request_id` | `req_001` | OR `input_ref`. 취소 호출 대상 |
+| `dispatch_reservation_id` | `R-20260804-0001` | OR `reservation_id`. 외부 provider 결과 ID |
+
+현재 OR의 외부 ID도 `R-...`처럼 보이지만 BE canonical 예약번호와 같은 ID가 아니다.
+BE는 둘을 별도 컬럼으로 저장한다. OR 응답의 `reservation_id`는 opaque provider ID로
+취급해야 한다.
+
+## 6. 서산 정류장 DB 연동
+
+OR-Tools 내부 canonical 정류장 원장은 다음 파일로 관리한다.
+
+- 원본 정리 데이터: `data/seosan_stops_source.tsv`
+- 런타임 DB: `data/seosan_stops.json`
+- 상세 설명: `SEOSAN_STOP_DATABASE.md`
+
+현재 등록 수:
+
+| 권역 | 코드 | 수 |
+|---|---|---:|
+| 대산 | `SEOSAN_DAESAN` | 238 |
+| 해미 | `SEOSAN_HAEMI` | 153 |
+| 고북 | `SEOSAN_GOBUK` | 198 |
+| 합계 | 전체 조회 `SEOSAN_CITY` | 589 |
+
+물리 정류장 식별자는 `stop_id`다. 표시명은 중복될 수 있으므로 식별자로 사용하지
+않는다. 예를 들어 `해미우체국`은 복수 물리 정류장 후보가 있을 수 있고,
+`해미시내버스승강장`의 통합ID는 `ST-H-129`다.
+
+현재 OR는 기존 BE 요청을 깨지 않기 위해 `origin`, `destination` 문자열을 계속
+받는다. 동시에 다음 additive 필드를 지원한다.
+
+- `origin_stop_id`
+- `destination_stop_id`
+- `region_code`
+- 응답의 정류장 통합ID
+
+정류장용 추가 API:
+
+| 메서드 | 경로 | 용도 |
+|---|---|---|
+| `GET` | `/drt/stops` | 권역·이름 검색 |
+| `POST` | `/drt/stops/resolve` | 이름/통합ID 해석과 중복 후보 반환 |
+| `GET` | `/drt/stops/nearest` | 이미 확보한 좌표에서 가까운 정류장 검색 |
+| `GET` | `/drt/stops/{stop_id}` | 정류장 상세 |
+
+`/drt/stops/resolve`의 `ambiguous`는 임의로 하나를 고르지 않고 사용자에게 재확인해야
+한다. `/drt/stops/nearest`는 지오코딩 API가 아니다. “해미읍성 남문” 같은 POI를
+위·경도로 바꾸는 책임은 BE 또는 지도 서비스에 있다.
+
+## 7. 이번 OR-Tools 쪽 반영 사항
+
+최신 BE 계약을 유지하면서 다음 안전성만 보완한다.
+
+- 신규 예약·취소를 lock으로 직렬화한다.
+- solver는 복제 상태에서 실행하고 성공한 경우에만 전역 상태에 반영한다.
+- 실패한 신규 요청이 이후 예약 목록과 solver 입력을 오염시키지 않는다.
+- 취소는 정확한 `req_NNN`만 허용한다.
+- 미존재 ID를 마지막 요청으로 바꾸던 fallback을 제거한다.
+- 반복 취소는 `ALREADY_CANCELLED`로 실패한다.
+- 후속 최적화에서 기존 예약의 차량과 약속한 픽업 시각을 고정한다.
+- 후속 요청은 거절할 수 있지만 이미 확정한 예약은 solver가 조용히 drop하지 못한다.
+- 정류장 ID 필드는 기존 평면형 문자열 계약에 추가하는 방식으로 유지한다.
+
+## 8. 현재 BE에서 남은 변경
+
+OR만 수정해서는 발표 시나리오 전체가 동작하지 않는다. 다음 항목은 최신 BE가 OR을
+호출하기 전에 막는 부분이다.
+
+### 8.1 12개 장소 allowlist
+
+`cmd/voice-session-server/ortools_adapter.go`의 `ortoolsLocations`가 현재 12개
+문자열만 허용한다. 다음 발표 장소는 그대로는 OR까지 도달하지 않는다.
+
+- 해미읍성 남문
+- 해미우체국 승강장
+- 신장2리 마을회관
+- 해미 시내버스 승강장
+
+589개 정류장을 사용하려면 BE가 고정 allowlist를 확장하는 대신 OR의 stop resolve
+API 또는 공유 정류장 원장을 사용하도록 바꾸는 것이 안전하다. 전환 중에는 기존
+12개 문자열 요청도 계속 지원해야 한다.
+
+### 8.2 탑승 인원 하드코딩
+
+최신 BE의 OR adapter는 Availability와 Create 모두 `passenger_count: 1`을 보낸다.
+AI가 2명을 인식해도 현재 BE 예약 요청 모델과 adapter를 거치는 동안 값이 전달되지
+않는다. 발표의 “2명”을 반영하려면 AI 슬롯 → BE dialog 요청 → OR client까지 인원
+필드를 연결해야 한다.
+
+### 8.3 POI·권역 밖·환승 정책
+
+다음 판단은 단순 VRP 문제가 아니다.
+
+- “해미읍성 남문”에서 가까운 지정 승강장 찾기
+- 목적지가 운행 권역 밖인지 판단하기
+- 환승 지점을 선택하고 시내버스 정보를 안내하기
+
+BE의 지도/운영 정책 계층과 OR 정류장 검색을 조합해야 한다. OR는 좌표가 확정된 뒤
+가까운 정류장을 계산하고, 확정된 승·하차 정류장 사이의 차량 경로를 최적화한다.
+
+### 8.4 실행 경로와 저장소
+
+- OR canary는 현재 내선 `9002`다.
+- PostgreSQL과 외부 dispatch ID 저장이 정상이어야 한다.
+- OR 장애 시 9002는 Mock 예약으로 조용히 성공시키지 않고 fail-closed한다.
+- BE가 OR 예약 생성 응답을 받지 못한 경우 안전한 자동 재시도 수단은 아직 없다.
+
+## 9. OR-Tools에 남은 운영 과제
+
+이번 계약 정합화와 별개로 실제 운영 전 결정할 항목이다.
+
+- 프로세스 재시작 후에도 예약·차량 상태를 복구할 영속 저장소
+- `client_ref` 기반 멱등 예약 또는 생성 결과 조회 API
+- Availability와 실제 solver 예약 결과의 일치 수준
+- 실시간 차량 위치·운행 중 승객·차량 비활성 상태 입력
+- 운영시간, 권역 간 이동, 휠체어 차량, 최대 대기시간 정책
+- timeout, solver 실패, 비정상 입력에 대한 관측 지표와 알림
+- Tailnet ACL 또는 서비스 인증 방식
+
+## 10. 배포 설정 경계
+
+최신 BE가 읽는 설정:
+
+- `ORTOOLS_BASE_URL`
+- `ORTOOLS_TIMEOUT`
+
+`DRT_SERVICE_URL`과 `MOCK_DRT`는 최신 OR adapter 설정이 아니다.
+
+OR 저장소의 `deploy/k3s/ortools.yaml`은 BE 팀이 관리하는 배포 설정이므로 이번
+작업에서 수정하지 않는다. Tailscale 주소, 포트 노출, canary 내선, timeout, Secret과
+PostgreSQL 설정도 BE 배포 기준으로 확정한다.
+
+예시:
 
 ```text
-POST /internal/dispatch/snapshot
-POST /internal/dispatch/events
-GET  /internal/dispatch/state
+ORTOOLS_BASE_URL=http://<KT_GROUP3_TAILSCALE_IP>:8092
+ORTOOLS_TIMEOUT=5s
 ```
 
-외부 노출 API와 내부 동기화 API는 인증 및 접근 범위를 분리하는 것을 권장합니다.
+실제 URL은 BE pod에서 `GET /health`가 되는 주소를 사용해야 한다.
 
----
+## 11. BE 팀 전달 체크리스트
 
-## 6. 현재 OR-Tools 서버에서 개선이 필요한 부분
+- [ ] 9002에서 `dispatch=ortools` 경로를 사용한다.
+- [ ] `ORTOOLS_BASE_URL`과 `ORTOOLS_TIMEOUT`을 설정한다.
+- [ ] BE pod에서 OR `/health`를 호출해 `2xx`를 확인한다.
+- [ ] 기존 평면형 `origin`/`destination` 계약을 유지한다.
+- [ ] 589개 정류장 사용 시 고정 allowlist를 stop resolve 연동으로 교체한다.
+- [ ] `origin_stop_id`와 `destination_stop_id`를 예약 데이터에 보존한다.
+- [ ] AI가 수집한 `passenger_count`를 OR까지 전달한다.
+- [ ] 사용자용 BE 예약 ID와 OR의 두 provider ID를 별도로 저장한다.
+- [ ] 취소 시 `dispatch_request_id=req_NNN`을 보낸다.
+- [ ] 발표 장소와 2명 요청을 실제 9002 E2E로 검증한다.
 
-현재 `dispatch/server.py` 기준으로 확인된 사항입니다.
+## 12. 최소 연동 확인 예시
 
-1. `client_ref`를 받지만 멱등성 처리에 사용하지 않습니다.
-2. 외부 `reservation_id`와 내부 `req_###`의 명시적 매핑이 없습니다.
-3. 취소 대상을 못 찾으면 마지막 내부 예약을 취소할 수 있습니다.
-4. Availability가 실제 OR-Tools 경로·시간창 검증을 수행하지 않습니다.
-5. 예상 픽업 시간이 고정 5분으로 계산됩니다.
-6. ISO 8601의 날짜와 타임존을 버리고 `HH:MM`만 사용합니다.
-7. 전역 sequence와 dispatcher 상태에 동시성 보호가 없습니다.
-8. 프로세스 재시작 시 예약과 차량 경로 상태가 사라집니다.
-9. 알 수 없는 위치를 임의 좌표로 생성해 배차를 계속합니다.
-10. 조회와 예약 확정에서 서로 다른 검증 로직을 사용합니다.
+```bash
+curl -sS "http://<OR_TAILSCALE_HOST>:8092/health"
 
-위 항목 중 알고리즘·내부 안전성은 OR-Tools 담당이고, ID·상태 원본·재시도·시간 및
-오류 계약은 BE와 합의 후 구현해야 합니다.
+curl -sS -X POST "http://<OR_TAILSCALE_HOST>:8092/drt/availability/check" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "region_code": "SEOSAN_CITY",
+    "origin": "서산시청",
+    "destination": "서산의료원",
+    "requested_pickup_at": "2026-08-04T13:56:00+09:00",
+    "passenger_count": 1
+  }'
 
----
+curl -sS -X POST "http://<OR_TAILSCALE_HOST>:8092/drt/reservations" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_ref": "manual-contract-check",
+    "passenger_phone": "01012345678",
+    "origin": "서산시청",
+    "destination": "서산의료원",
+    "requested_pickup_at": "2026-08-04T13:56:00+09:00",
+    "passenger_count": 1,
+    "region_code": "SEOSAN_CITY"
+  }'
+```
 
-## 7. BE 팀 회의 체크리스트
+예약 생성 응답의 `input_ref`를 취소 요청의 `target_reservation_id`로 그대로 사용한다.
 
-- [ ] 예약 ID 생성 주체
-- [ ] `client_ref`, `request_id`, `session_id`의 정의와 수명
-- [ ] 멱등성 보장 범위와 보관 기간
-- [ ] Availability의 차량 홀드 여부
-- [ ] 예약 생성의 원자성
-- [ ] 예약·차량·경로 상태의 원본 시스템
-- [ ] OR-Tools 재시작 및 상태 복구 방식
-- [ ] 취소·변경 API와 상태 전이 규칙
-- [ ] ISO 8601 및 `Asia/Seoul` 사용
-- [ ] 운영시간·휴무일 정책 소유 주체
-- [ ] HTTP 상태 코드와 업무 오류 코드
-- [ ] BE 타임아웃, 재시도 횟수 및 간격
-- [ ] Solver 시간 제한과 타임아웃 응답
-- [ ] Tailscale 서비스 주소와 포트
-- [ ] 인증 방식, 접근 제어 및 요청 추적 ID
-- [ ] API 버전 관리 방식
+## 13. 발표 시나리오 판단
 
----
+현재 코드만으로는 발표 시나리오 전체가 그대로 이어지지 않는다.
 
-## 8. 회의에서 전달할 요약
+1. AI가 장소와 인원을 수집하는 대화는 가능하다.
+2. “해미읍성 남문 → 해미우체국 승강장”은 POI 좌표와 nearest-stop 연동이 필요하다.
+3. “신장2리 권역 밖 → 환승 지점”은 BE 운영 정책과 환승 데이터가 필요하다.
+4. 현재 BE allowlist는 발표 장소를 OR 호출 전에 거절한다.
+5. 현재 BE는 2명을 1명으로 바꿔 OR에 보낸다.
+6. 출발·도착 정류장과 인원이 확정되어 OR까지 도달하면 Availability, 예약 생성,
+   차량 선택, 픽업 시각 반환은 현재 계약으로 수행할 수 있다.
 
-> OR-Tools 팀은 차량 정원, 시간창, 픽업·하차 순서, 최대 우회시간을 적용해 최적
-> 차량과 경로를 계산하겠습니다. 연동 구현 전에 예약 ID 생성 주체, 멱등성 키,
-> Availability의 홀드 여부, 예약 및 차량 상태의 원본, 취소·변경 규칙, 날짜·시간
-> 형식, 타임아웃·재시도·오류 코드를 BE 팀과 확정해야 합니다. 예약의 업무 원본은
-> BE가, 차량·경로 최적화 상태는 OR-Tools가 소유하고, 예약 생성 요청은 원자적으로
-> 검증·배정하는 구조를 권장합니다.
+따라서 OR 계약을 BE 전체 예약 형식으로 바꾸는 것이 해결책은 아니다. OR의 현재
+provider 계약을 유지하고, BE의 장소 해석·인원 전달·운영 정책 연결을 보완하는 것이
+필요하다.

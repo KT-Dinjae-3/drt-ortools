@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY dispatch/ ./dispatch/
+COPY data/seosan_stops.json ./data/seosan_stops.json
 
 EXPOSE 8092
 

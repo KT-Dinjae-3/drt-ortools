@@ -30,6 +30,10 @@ from .locations import (
     LOCATION_DB, DEFAULT_DEPOT, resolve_location_name, get_location,
     resolve_location_key, load_locations_from_json,
 )
+from .stops import (
+    REGION_NAMES, STOP_CATALOG, STOP_DB, StopCatalog, StopRecord,
+    StopResolution, normalize_region_code, normalize_stop_name,
+)
 from .validators import validate_event, check_imminent_cancellation
 
 __all__ = [
@@ -56,6 +60,15 @@ __all__ = [
     "get_location",
     "resolve_location_key",
     "load_locations_from_json",
+    # Stops
+    "REGION_NAMES",
+    "STOP_CATALOG",
+    "STOP_DB",
+    "StopCatalog",
+    "StopRecord",
+    "StopResolution",
+    "normalize_region_code",
+    "normalize_stop_name",
     # Validators
     "validate_event",
     "check_imminent_cancellation",

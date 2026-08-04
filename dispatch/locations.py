@@ -2,18 +2,19 @@
 dispatch/locations.py -- 정류장 좌표 <-> 한글 명칭 매핑 DB
 =========================================================
 팀 공유 dispatch_input_timeline.json의 locations 섹션과 동기화됩니다.
-키 문자열(예: jongno3ga_station) <-> Location 객체 변환을 담당합니다.
+키 문자열(예: seosan_bus_terminal) <-> Location 객체 변환을 담당합니다.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from .models import Location
+from .stops import STOP_CATALOG, STOP_DB
 
 
 # ---------------------------------------------------------------------------
-# 서산시 정류장/거점 DB (행복택시/DRT 전용) & 종로구 호환 DB
+# 서산시 정류장/거점 DB (행복버스/DRT 전용)
 # ---------------------------------------------------------------------------
 
 LOCATION_DB: Dict[str, Location] = {
@@ -51,45 +52,31 @@ LOCATION_DB: Dict[str, Location] = {
     "jigok_office": Location(
         lat=36.8720, lng=126.4250, name="지곡면 행정복지센터"
     ),
+    # 데모 호환용 기본 자택. 운영 환경에서는 BE의 승객별 좌표로 대체합니다.
     "home_default": Location(
         lat=36.7900, lng=126.4900, name="집"
     ),
-
-    # ── 레거시 종로구 정류장 DB (호환용) ──
-    "jongno_gu_office": Location(
-        lat=37.5730, lng=126.9794, name="종로구청"
-    ),
-    "jongno_senior_center_main": Location(
-        lat=37.5824, lng=127.0024, name="종로노인종합복지관 본관"
-    ),
-    "seoul_senior_welfare_center": Location(
-        lat=37.5705, lng=126.9849, name="서울노인복지센터"
-    ),
-    "hyehwa_station": Location(
-        lat=37.5824, lng=127.0019, name="혜화역"
-    ),
-    "jongno3ga_station": Location(
-        lat=37.5703, lng=126.9919, name="종로3가역"
-    ),
-    "seoul_univ_hospital": Location(
-        lat=37.5797, lng=126.9966, name="서울대학교병원"
-    ),
-    "kyunghee_oriental_hospital": Location(
-        lat=37.5926, lng=127.0517, name="경희대학교 한방병원"
-    ),
-    "tapgol_park": Location(
-        lat=37.5712, lng=126.9883, name="탑골공원"
-    ),
-    "dongmyo_station": Location(
-        lat=37.5726, lng=127.0166, name="동묘앞역"
-    ),
-    "gyeongbokgung_station": Location(
-        lat=37.5759, lng=126.9733, name="경복궁역"
-    ),
 }
 
-# 한글 명칭 -> 키 역매핑
-_NAME_TO_KEY: Dict[str, str] = {loc.name: key for key, loc in LOCATION_DB.items()}
+# 제공된 서산 정류장 원장의 통합ID를 실제 경로 노드로 등록합니다. 동일한
+# 대표명을 가진 물리 정류장은 합치지 않고 각각의 통합ID로 유지합니다.
+for _stop_id, _stop in STOP_DB.items():
+    if _stop.routable:
+        LOCATION_DB[_stop_id] = _stop.to_location()
+
+
+# 한글 명칭 -> 키 목록 역매핑. 이름 중복 시 임의의 한 정류장을 고르지 않습니다.
+_NAME_TO_KEYS: Dict[str, List[str]] = {}
+
+
+def _rebuild_name_index() -> None:
+    _NAME_TO_KEYS.clear()
+    for location_key, location in LOCATION_DB.items():
+        if location.name:
+            _NAME_TO_KEYS.setdefault(location.name, []).append(location_key)
+
+
+_rebuild_name_index()
 
 # 기본 Depot 위치 (서산시청)
 DEFAULT_DEPOT = LOCATION_DB["seosan_city_hall"]
@@ -104,10 +91,21 @@ def get_location(key: str) -> Optional[Location]:
     """키 문자열(예: 'emam_town_hall') 또는 한글 명칭(예: '음암면 마을회관')으로 Location 조회."""
     if not key:
         return None
-    if key in LOCATION_DB:
-        return LOCATION_DB[key]
-    if key in _NAME_TO_KEY:
-        return LOCATION_DB[_NAME_TO_KEY[key]]
+    normalized_key = key.strip()
+    if normalized_key in LOCATION_DB:
+        return LOCATION_DB[normalized_key]
+
+    stop = STOP_CATALOG.get(normalized_key)
+    if stop and stop.routable:
+        return stop.to_location()
+
+    name_keys = _NAME_TO_KEYS.get(normalized_key, [])
+    if len(name_keys) == 1:
+        return LOCATION_DB[name_keys[0]]
+
+    resolution = STOP_CATALOG.resolve(normalized_key)
+    if resolution.record and resolution.record.routable:
+        return resolution.record.to_location()
     return None
 
 
@@ -135,9 +133,14 @@ def resolve_location_name(loc: Location) -> str:
 
 
 def resolve_location_key(loc: Location) -> str:
-    """Location 객체에서 키 문자열(예: 'jongno3ga_station')을 반환."""
-    if loc.name and loc.name in _NAME_TO_KEY:
-        return _NAME_TO_KEY[loc.name]
+    """Location 객체에서 키 문자열(예: 'seosan_bus_terminal')을 반환."""
+    if loc.location_id and loc.location_id in LOCATION_DB:
+        return loc.location_id
+
+    if loc.name:
+        name_keys = _NAME_TO_KEYS.get(loc.name, [])
+        if len(name_keys) == 1:
+            return name_keys[0]
 
     best_key = ""
     best_dist = float("inf")
@@ -158,11 +161,18 @@ def load_locations_from_json(locations_dict: Dict[str, Dict]) -> None:
     팀원이 JSON에 정류장을 추가하면 자동 반영됩니다.
     """
     for key, loc_data in locations_dict.items():
+        if key in STOP_DB:
+            raise ValueError(
+                f"canonical stop {key} cannot be overwritten by timeline locations"
+            )
+        if "lat" not in loc_data or "lng" not in loc_data:
+            raise ValueError(f"location {key} requires both lat and lng")
         LOCATION_DB[key] = Location(
-            lat=loc_data.get("lat", 0.0),
-            lng=loc_data.get("lng", 0.0),
+            lat=float(loc_data["lat"]),
+            lng=float(loc_data["lng"]),
             name=loc_data.get("name", key),
+            location_id=loc_data.get("location_id"),
+            region_code=loc_data.get("region_code"),
         )
     # 역매핑 갱신
-    _NAME_TO_KEY.clear()
-    _NAME_TO_KEY.update({loc.name: key for key, loc in LOCATION_DB.items()})
+    _rebuild_name_index()

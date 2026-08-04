@@ -59,6 +59,10 @@ class Location:
     lat: float
     lng: float
     name: str = ""
+    # 정류장 카탈로그에서 생성된 위치라면 canonical 통합ID/권역을 보존합니다.
+    # 기존 위치 키 기반 입력과의 하위 호환을 위해 둘 다 선택 필드입니다.
+    location_id: Optional[str] = None
+    region_code: Optional[str] = None
 
     def distance_to(self, other: "Location") -> float:
         """Haversine 거리 (km)."""
@@ -75,14 +79,27 @@ class Location:
         return R * c
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"name": self.name, "lat": self.lat, "lng": self.lng}
+        result: Dict[str, Any] = {
+            "name": self.name,
+            "lat": self.lat,
+            "lng": self.lng,
+        }
+        if self.location_id:
+            result["location_id"] = self.location_id
+        if self.region_code:
+            result["region_code"] = self.region_code
+        return result
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Location":
+        if "lat" not in d or "lng" not in d:
+            raise ValueError("location requires both lat and lng")
         return cls(
-            lat=d.get("lat", 0.0),
-            lng=d.get("lng", 0.0),
+            lat=float(d["lat"]),
+            lng=float(d["lng"]),
             name=d.get("name", ""),
+            location_id=d.get("location_id") or d.get("stop_id"),
+            region_code=d.get("region_code"),
         )
 
 

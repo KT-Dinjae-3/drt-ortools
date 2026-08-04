@@ -47,7 +47,7 @@ def dump_result(output, label="Result"):
 
 def run_all_scenarios():
     print("\n" + "=" * 70)
-    print("  DRT 15-Scenario Integration Test (Team JSON Format)")
+    print("  Seosan DRT 15-Scenario Integration Test (Team JSON Format)")
     print("=" * 70)
 
     # Load team input data
@@ -93,13 +93,13 @@ def run_all_scenarios():
                 ok &= check(True, f"Seq 3: ride_share_with = {result.ride_share_with}")
 
         elif seq == 4:
-            ok &= check(result.status == "success", "Seq 4: Tapgol -> Welfare success")
+            ok &= check(result.status == "success", "Seq 4: Haemi -> Eumam town hall success")
 
         elif seq == 5:
-            ok &= check(result.status == "success", "Seq 5: Senior Center -> Hospital success")
+            ok &= check(result.status == "success", "Seq 5: Eumam office -> Seosan Medical Center success")
 
         elif seq == 6:
-            ok &= check(result.status == "success", "Seq 6: Dongmyo -> Hyehwa success")
+            ok &= check(result.status == "success", "Seq 6: Seongyeon -> Seosan Medical Center success")
 
         elif seq == 7:
             ok &= check(result.status == "success", "Seq 7: Additional 10:30 reservation success")
@@ -130,10 +130,10 @@ def run_all_scenarios():
             ok &= check(result.status == "success", "Seq 12: Long-distance reservation")
 
         elif seq == 13:
-            ok &= check(result.status == "success", "Seq 13: Tapgol -> Jongno-gu Office")
+            ok &= check(result.status == "success", "Seq 13: Haemi -> Seosan City Hall")
 
         elif seq == 14:
-            ok &= check(result.status == "success", "Seq 14: Tapgol -> Seoul Hospital")
+            ok &= check(result.status == "success", "Seq 14: Haemi -> Seosan Medical Center")
 
         elif seq == 15:
             ok &= check(result.status == "success", "Seq 15: Imminent cancellation")

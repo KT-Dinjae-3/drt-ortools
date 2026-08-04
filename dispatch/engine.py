@@ -48,8 +48,8 @@ class DynamicDRTDispatcher:
         from dispatch.models import Vehicle, Location
 
         dispatcher = DynamicDRTDispatcher(
-            vehicles=[Vehicle("DRT-V01", capacity=11)],
-            depot=Location(37.5735, 126.9790, "종로구차고지"),
+            vehicles=[Vehicle("DRT-SS-01", capacity=11)],
+            depot=Location(36.7845, 126.4501, "서산시청 차고지"),
         )
         adapter = DispatchIOAdapter()
 
@@ -160,6 +160,17 @@ class DynamicDRTDispatcher:
             )
 
         req = self.requests[target_id]
+        if req.status == RequestStatus.CANCELLED:
+            return DispatchResult(
+                seq=event.seq,
+                status="failed",
+                action=ActionType.CANCELLATION.value,
+                request_id=target_id,
+                input_ref=f"{target_id} 취소",
+                error_code=ErrorCode.ALREADY_CANCELLED.value,
+                reason=f"Reservation {target_id} is already cancelled.",
+            )
+
         freed_vehicle = req.assigned_vehicle_id
 
         # 임박 취소 체크
@@ -299,7 +310,12 @@ class DynamicDRTDispatcher:
         """취소/완료가 아닌 활성 요청 목록."""
         return [
             r for r in self.requests.values()
-            if r.status not in (RequestStatus.CANCELLED, RequestStatus.COMPLETED)
+            if r.status
+            not in (
+                RequestStatus.CANCELLED,
+                RequestStatus.COMPLETED,
+                RequestStatus.FAILED,
+            )
         ]
 
     def _build_nodes(self, active: List[PassengerRequest]):
@@ -368,6 +384,10 @@ class DynamicDRTDispatcher:
         num_nodes = len(nodes)
         num_vehicles = len(self.vehicles)
         vehicle_list = list(self.vehicles.values())
+        vehicle_index_by_id = {
+            vehicle.vehicle_id: index
+            for index, vehicle in enumerate(vehicle_list)
+        }
         depot_index = 0
 
         # ── OR-Tools 모델 구성 ──
@@ -409,17 +429,31 @@ class DynamicDRTDispatcher:
             routing.AddPickupAndDelivery(pi_idx, di_idx)
             solver.Add(routing.VehicleVar(pi_idx) == routing.VehicleVar(di_idx))
             solver.Add(time_dim.CumulVar(pi_idx) <= time_dim.CumulVar(di_idx))
+            request = req_map[pi]
+            if request.assigned_vehicle_id in vehicle_index_by_id:
+                solver.Add(
+                    routing.VehicleVar(pi_idx)
+                    == vehicle_index_by_id[request.assigned_vehicle_id]
+                )
 
         # Time Window 제약
         for pi in pickups:
             req = req_map[pi]
-            tw_start = max(0, req.requested_pickup_time - cfg.PICKUP_TW_EARLY_SLACK)
-            tw_end = req.requested_pickup_time + cfg.PICKUP_TW_LATE_SLACK
             idx = manager.NodeToIndex(pi)
-            time_dim.CumulVar(idx).SetRange(tw_start, tw_end)
-            time_dim.SetCumulVarSoftUpperBound(
-                idx, req.requested_pickup_time, cfg.DELAY_PENALTY_COEFF
-            )
+            if req.promised_pickup_time is not None:
+                time_dim.CumulVar(idx).SetRange(
+                    req.promised_pickup_time,
+                    req.promised_pickup_time,
+                )
+            else:
+                tw_start = max(
+                    0, req.requested_pickup_time - cfg.PICKUP_TW_EARLY_SLACK
+                )
+                tw_end = req.requested_pickup_time + cfg.PICKUP_TW_LATE_SLACK
+                time_dim.CumulVar(idx).SetRange(tw_start, tw_end)
+                time_dim.SetCumulVarSoftUpperBound(
+                    idx, req.requested_pickup_time, cfg.DELAY_PENALTY_COEFF
+                )
 
         for di in dropoffs:
             req = req_map[di]
@@ -448,10 +482,21 @@ class DynamicDRTDispatcher:
             time_dim.CumulVar(routing.Start(v_idx)).SetRange(0, cfg.MAX_ROUTE_HORIZON)
             time_dim.CumulVar(routing.End(v_idx)).SetRange(0, cfg.MAX_ROUTE_HORIZON)
 
-        # 모든 요청에 대해 Drop Penalty 설정
+        # 신규 요청만 선택적으로 거절할 수 있습니다. 이미 확정된 요청까지
+        # drop 가능하게 두면 후속 최적화가 BE에 확정 응답을 준 예약을 조용히
+        # 제거할 수 있으므로 기존 요청은 필수 노드로 유지합니다.
         for pi, di in zip(pickups, dropoffs):
-            routing.AddDisjunction([manager.NodeToIndex(pi)], cfg.PENALTY_FOR_DROPPING)
-            routing.AddDisjunction([manager.NodeToIndex(di)], cfg.PENALTY_FOR_DROPPING)
+            request = req_map[pi]
+            if (
+                action == ActionType.NEW_RESERVATION
+                and request.request_id == target_request_id
+            ):
+                routing.AddDisjunction(
+                    [manager.NodeToIndex(pi)], cfg.PENALTY_FOR_DROPPING
+                )
+                routing.AddDisjunction(
+                    [manager.NodeToIndex(di)], cfg.PENALTY_FOR_DROPPING
+                )
 
         # ── 솔버 파라미터 ──
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
