@@ -1,6 +1,7 @@
 .git
 tests/
-data/
+data/*
+!data/seosan_stops.json
 __pycache__/
 *.pyc
 .gitignore
