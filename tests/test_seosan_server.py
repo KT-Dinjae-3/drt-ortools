@@ -82,23 +82,19 @@ class TestSeosanDRTServer(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertIn("reservations", data)
-        self.assertGreaterEqual(data["count"], 1)
+        self.assertEqual(data["count"], 0)
+        self.assertTrue(data["stateless"])
 
     def test_06_cancel_reservation(self):
-        # 1) 현재 활성화된 예약 ID 조회
-        list_res = self.client.get("/drt/reservations").json()
-        self.assertGreaterEqual(list_res["count"], 1)
-        target_id = list_res["reservations"][0]["request_id"]
-
         payload = {
-            "target_reservation_id": target_id,
+            "target_reservation_id": "be-owned-request",
             "reason": "승객 일정 변경",
         }
         response = self.client.post("/drt/reservations/cancel", json=payload)
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertEqual(data["status"], "success")
-        self.assertEqual(data["action"], "cancellation")
+        self.assertEqual(data["status"], "failed")
+        self.assertEqual(data["error_code"], "STATELESS_CANCEL_OWNED_BY_BACKEND")
 
 
 

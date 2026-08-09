@@ -12,8 +12,9 @@ OR-Tools 배차 마이크로서비스.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import logging
-import threading
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Path as FastPath, Query, Request
@@ -69,10 +70,18 @@ DEFAULT_VEHICLES = [
     ),
 ]
 
-dispatcher = DynamicDRTDispatcher(vehicles=DEFAULT_VEHICLES, depot=seosan_depot)
 adapter = DispatchIOAdapter()
-seq_counter = 0
-state_lock = threading.RLock()
+
+
+class ActiveReservationSnapshot(BaseModel):
+    """Canonical BE reservation replayed into one stateless planning request."""
+
+    request_id: str
+    passenger_phone: Optional[str] = "user_anon"
+    origin_stop_id: str
+    destination_stop_id: str
+    requested_pickup_at: str
+    passenger_count: int = Field(default=1, ge=1)
 
 # ---------------------------------------------------------------------------
 # Pydantic Schemas (BE REST 호환)
@@ -85,6 +94,8 @@ class AvailabilityCheckRequest(BaseModel):
     destination_stop_id: Optional[str] = Field(default=None, description="도착 정류장 통합ID")
     requested_pickup_at: str = Field(..., description="ISO 8601 시각 string")
     passenger_count: int = Field(default=1, ge=1)
+    operation_id: Optional[str] = None
+    active_reservations: List[ActiveReservationSnapshot] = Field(default_factory=list)
 
 
 class CreateReservationRequest(BaseModel):
@@ -97,6 +108,8 @@ class CreateReservationRequest(BaseModel):
     requested_pickup_at: str
     passenger_count: int = Field(default=1, ge=1)
     region_code: Optional[str] = "SEOSAN_CITY"
+    operation_id: Optional[str] = None
+    active_reservations: List[ActiveReservationSnapshot] = Field(default_factory=list)
 
 
 class CancelReservationRequest(BaseModel):
@@ -136,67 +149,68 @@ async def api_input_error_handler(
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
-def _next_seq() -> int:
-    global seq_counter
-    seq_counter += 1
-    return seq_counter
-
-
 def _process_new_dispatch(
+    target_dispatcher: DynamicDRTDispatcher,
+    request_id: str,
+    sequence: int,
     time_str: str,
     passenger_phone: str,
     pickup_loc: Location,
     dropoff_loc: Location,
     passenger_count: int,
 ):
-    """새 요청을 복제 상태에서 풀고 성공한 경우에만 전역 상태에 반영합니다."""
-    global dispatcher
-
-    with state_lock:
-        sequence = _next_seq()
-        req_id = f"req_{sequence:03d}"
-        raw_event = {
-            "seq": sequence,
-            "event_type": "new_request",
-            "event_time": time_str,
-            "user_id": passenger_phone or "user_anon",
-            "request_id": req_id,
-            "payload": {
-                "pickup": pickup_loc.to_dict(),
-                "dropoff": dropoff_loc.to_dict(),
-                "requested_pickup_time": time_str,
-                "passenger_count": passenger_count,
-            },
-        }
-        candidate_dispatcher = copy.deepcopy(dispatcher)
-        event = adapter.parse_event(raw_event)
-        result = candidate_dispatcher.process_event(event)
-        if result.status == "success":
-            dispatcher = candidate_dispatcher
-        return sequence, req_id, result
+    """Apply one request to a caller-owned dispatcher; no module state changes."""
+    raw_event = {
+        "seq": sequence,
+        "event_type": "new_request",
+        "event_time": time_str,
+        "user_id": passenger_phone or "user_anon",
+        "request_id": request_id,
+        "payload": {
+            "pickup": pickup_loc.to_dict(),
+            "dropoff": dropoff_loc.to_dict(),
+            "requested_pickup_time": time_str,
+            "passenger_count": passenger_count,
+        },
+    }
+    event = adapter.parse_event(raw_event)
+    return target_dispatcher.process_event(event)
 
 
-def _process_cancellation(target_id: str, time_str: str):
-    """정확한 OR input_ref만 취소하고 성공한 변경만 커밋합니다."""
-    global dispatcher
+def _dispatcher_from_snapshot(
+    snapshots: List[ActiveReservationSnapshot], region_code: Optional[str]
+) -> DynamicDRTDispatcher:
+    """Rebuild the solver input from BE canonical state for this request only."""
+    planned = DynamicDRTDispatcher(vehicles=copy.deepcopy(DEFAULT_VEHICLES), depot=seosan_depot)
+    for sequence, snapshot in enumerate(snapshots, start=1):
+        pickup = _resolve_request_location(None, snapshot.origin_stop_id, region_code, "출발지")
+        dropoff = _resolve_request_location(None, snapshot.destination_stop_id, region_code, "목적지")
+        result = _process_new_dispatch(
+            planned,
+            snapshot.request_id,
+            sequence,
+            _parse_time_str(snapshot.requested_pickup_at),
+            snapshot.passenger_phone or "user_anon",
+            pickup,
+            dropoff,
+            snapshot.passenger_count,
+        )
+        if result.status != "success":
+            raise APIInputError(
+                409,
+                "INVALID_ACTIVE_RESERVATION_SNAPSHOT",
+                f"활성 예약 snapshot을 재구성할 수 없습니다: {snapshot.request_id}",
+            )
+    return planned
 
-    with state_lock:
-        sequence = _next_seq()
-        raw_event = {
-            "seq": sequence,
-            "event_type": "cancellation",
-            "event_time": time_str,
-            "target_reservation_id": target_id,
-            "payload": {
-                "target_reservation_id": target_id,
-            },
-        }
-        candidate_dispatcher = copy.deepcopy(dispatcher)
-        event = adapter.parse_event(raw_event)
-        result = candidate_dispatcher.process_event(event)
-        if result.status == "success":
-            dispatcher = candidate_dispatcher
-        return result
+
+def _plan_id(req: CreateReservationRequest, input_ref: str) -> str:
+    canonical = req.model_dump(mode="json")
+    canonical["input_ref"] = input_ref
+    digest = hashlib.sha256(
+        json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16].upper()
+    return f"PLAN-{digest}"
 
 
 def _parse_time_str(iso_at: str) -> str:
@@ -321,7 +335,8 @@ def health():
         "status": "ok",
         "service": "seosan-drt-ortools",
         "region": "서산시 행복버스 DRT",
-        "active_vehicles": sum(1 for vehicle in dispatcher.vehicles.values() if vehicle.is_active),
+        "stateless": True,
+        "active_vehicles": sum(1 for vehicle in DEFAULT_VEHICLES if vehicle.is_active),
         "total_locations": len(LOCATION_DB),
         "total_stops": len(STOP_CATALOG),
         "routable_stops": routable_stops,
@@ -421,11 +436,10 @@ def check_availability(req: AvailabilityCheckRequest):
         req.destination, req.destination_stop_id, req.region_code, "목적지"
     )
 
+    planned = _dispatcher_from_snapshot(req.active_reservations, req.region_code)
     assigned_v = None
     min_dist = float("inf")
-    with state_lock:
-        vehicles = copy.deepcopy(dispatcher.vehicles)
-    for vehicle_id, vehicle in vehicles.items():
+    for vehicle_id, vehicle in planned.vehicles.items():
         available_seats = vehicle.capacity - vehicle.current_load
         if vehicle.is_active and available_seats >= req.passenger_count:
             distance = pickup_loc.distance_to(vehicle.current_location)
@@ -446,6 +460,7 @@ def check_availability(req: AvailabilityCheckRequest):
             "origin_stop_id": pickup_loc.location_id,
             "destination_stop_id": dropoff_loc.location_id,
             "region_code": _validated_region(req.region_code),
+            "operation_id": req.operation_id,
         }
 
     return JSONResponse(
@@ -469,7 +484,12 @@ def create_reservation(req: CreateReservationRequest):
         req.destination, req.destination_stop_id, req.region_code, "목적지"
     )
 
-    sequence, req_id, result = _process_new_dispatch(
+    planned = _dispatcher_from_snapshot(req.active_reservations, req.region_code)
+    input_ref = (req.operation_id or req.client_ref).strip()
+    result = _process_new_dispatch(
+        planned,
+        input_ref,
+        len(req.active_reservations) + 1,
         time_str,
         req.passenger_phone or "user_anon",
         pickup_loc,
@@ -479,9 +499,12 @@ def create_reservation(req: CreateReservationRequest):
 
     res_dict = result.to_dict()
     res_dict["session_id"] = req.client_ref
-    res_dict["reservation_id"] = (
-        f"R-{datetime.now(KST).strftime('%Y%m%d')}-{sequence:04d}"
-    )
+    plan_id = _plan_id(req, input_ref)
+    res_dict["input_ref"] = input_ref
+    res_dict["plan_id"] = plan_id
+    # Kept for the current BE client during the coordinated rollout. This is a
+    # deterministic plan identifier, not OR-owned reservation state.
+    res_dict["reservation_id"] = plan_id
     res_dict["origin_stop_id"] = pickup_loc.location_id
     res_dict["destination_stop_id"] = dropoff_loc.location_id
     res_dict["region_code"] = _validated_region(req.region_code)
@@ -513,25 +536,7 @@ def create_reservation(req: CreateReservationRequest):
 
 @app.get("/drt/reservations", summary="BE 연동: 현재 배차 내역 및 예약 현황 조회")
 def list_reservations():
-    with state_lock:
-        requests = copy.deepcopy(dispatcher.requests)
-    active_reqs = []
-    for req_id, p_req in requests.items():
-        active_reqs.append(
-            {
-                "request_id": req_id,
-                "user_id": p_req.user_id,
-                "passenger_count": p_req.passenger_count,
-                "pickup_location": p_req.pickup_location.name,
-                "dropoff_location": p_req.dropoff_location.name,
-                "origin_stop_id": p_req.pickup_location.location_id,
-                "destination_stop_id": p_req.dropoff_location.location_id,
-                "requested_pickup_time": minutes_to_time_str(p_req.requested_pickup_time),
-                "status": p_req.status.value,
-                "assigned_vehicle_id": p_req.assigned_vehicle_id,
-            }
-        )
-    return {"reservations": active_reqs, "count": len(active_reqs)}
+    return {"reservations": [], "count": 0, "stateless": True}
 
 
 @app.post("/drt/reservations/cancel", summary="BE 연동: 예약 취소 처리 (POST)")
@@ -545,12 +550,10 @@ def cancel_reservation_patch(reservation_id: str = FastPath(...)):
 
 
 def _do_cancellation(target_id: str) -> Dict[str, Any]:
-    time_str = datetime.now(KST).strftime("%H:%M")
-
-    result = _process_cancellation(target_id, time_str)
-    res_dict = result.to_dict()
-    if result.status == "success":
-        res_dict["cancelled_reservation_id"] = target_id
-    return res_dict
-
+    return {
+        "status": "failed",
+        "error_code": "STATELESS_CANCEL_OWNED_BY_BACKEND",
+        "reason": "예약 취소 상태는 백엔드가 관리합니다.",
+        "target_reservation_id": target_id,
+    }
 

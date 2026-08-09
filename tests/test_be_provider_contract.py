@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import copy
 import unittest
 
 from fastapi.testclient import TestClient
 
 from dispatch import server
-from dispatch.engine import DynamicDRTDispatcher
-from dispatch.models import RequestStatus
 
 
 BACKEND_ALLOWED_LOCATIONS = (
@@ -33,19 +30,8 @@ class TestBackendProviderContract(unittest.TestCase):
 
     def setUp(self):
         self.client = TestClient(server.app)
-        with server.state_lock:
-            self._original_dispatcher = server.dispatcher
-            self._original_seq_counter = server.seq_counter
-            server.dispatcher = DynamicDRTDispatcher(
-                vehicles=copy.deepcopy(server.DEFAULT_VEHICLES),
-                depot=copy.deepcopy(server.seosan_depot),
-            )
-            server.seq_counter = 0
 
     def tearDown(self):
-        with server.state_lock:
-            server.dispatcher = self._original_dispatcher
-            server.seq_counter = self._original_seq_counter
         self.client.close()
 
     @staticmethod
@@ -58,6 +44,7 @@ class TestBackendProviderContract(unittest.TestCase):
             "requested_pickup_at": "2030-08-04T13:00:00+09:00",
             "passenger_count": 1,
             "region_code": "SEOSAN_CITY",
+            "operation_id": "be-contract-call-001:create",
         }
         payload.update(overrides)
         return payload
@@ -111,65 +98,30 @@ class TestBackendProviderContract(unittest.TestCase):
                     msg=f"{location}: {response.text}",
                 )
 
-    def test_create_and_cancel_match_backend_wire_contract(self):
+    def test_create_is_deterministic_and_keeps_no_server_reservation(self):
         created = self._create_reservation()
 
         self.assertEqual(created.status_code, 200)
         body = created.json()
         self.assertEqual(body["status"], "success")
         self.assertTrue(body["reservation_id"])
-        self.assertRegex(body["input_ref"], r"^req_[0-9]{3,}$")
+        self.assertEqual(body["input_ref"], "be-contract-call-001:create")
+        self.assertTrue(body["plan_id"])
         self.assertTrue(body["vehicle_id"])
         self.assertRegex(body["pickup_time"], r"^\d{2}:\d{2}$")
 
-        request_id = body["input_ref"]
-        cancelled = self.client.post(
+        repeated = self._create_reservation().json()
+        self.assertEqual(repeated["plan_id"], body["plan_id"])
+        self.assertEqual(self.client.get("/drt/reservations").json()["count"], 0)
+
+    def test_cancel_declares_backend_ownership(self):
+        response = self.client.post(
             "/drt/reservations/cancel",
-            json={
-                "target_reservation_id": request_id,
-                "reason": "이용자 전화 취소",
-            },
+            json={"target_reservation_id": "call:create", "reason": "이용자 요청"},
         )
-
-        self.assertEqual(cancelled.status_code, 200)
-        cancel_body = cancelled.json()
-        self.assertEqual(cancel_body["status"], "success")
-        self.assertEqual(cancel_body["cancelled_reservation_id"], request_id)
-
-    def test_unknown_cancel_never_falls_back_to_another_reservation(self):
-        created = self._create_reservation().json()
-        real_request_id = created["input_ref"]
-
-        unknown = self.client.post(
-            "/drt/reservations/cancel",
-            json={"target_reservation_id": "req_999999", "reason": "잘못된 ID"},
-        )
-
-        self.assertEqual(unknown.status_code, 200)
-        unknown_body = unknown.json()
-        self.assertEqual(unknown_body["status"], "failed")
-        self.assertEqual(unknown_body["error_code"], "REQUEST_NOT_FOUND")
-        self.assertNotIn("cancelled_reservation_id", unknown_body)
-
-        with server.state_lock:
-            self.assertEqual(
-                server.dispatcher.requests[real_request_id].status,
-                RequestStatus.ASSIGNED,
-            )
-
-        exact = self.client.post(
-            "/drt/reservations/cancel",
-            json={"target_reservation_id": real_request_id},
-        )
-        self.assertEqual(exact.json()["cancelled_reservation_id"], real_request_id)
-
-        repeated = self.client.post(
-            "/drt/reservations/cancel",
-            json={"target_reservation_id": real_request_id},
-        )
-        self.assertEqual(repeated.status_code, 200)
-        self.assertEqual(repeated.json()["status"], "failed")
-        self.assertEqual(repeated.json()["error_code"], "ALREADY_CANCELLED")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "failed")
+        self.assertEqual(response.json()["error_code"], "STATELESS_CANCEL_OWNED_BY_BACKEND")
 
     def test_failed_create_does_not_contaminate_live_dispatch_state(self):
         failed = self._create_reservation(
@@ -182,25 +134,29 @@ class TestBackendProviderContract(unittest.TestCase):
         listed = self.client.get("/drt/reservations").json()
         self.assertEqual(listed["count"], 0)
 
-    def test_later_request_preserves_existing_vehicle_and_pickup_commitment(self):
+    def test_later_request_replays_backend_active_reservations(self):
         first = self._create_reservation().json()
-        first_id = first["input_ref"]
-        with server.state_lock:
-            before = copy.deepcopy(server.dispatcher.requests[first_id])
+        active = [{
+            "request_id": first["input_ref"],
+            "passenger_phone": "01012345678",
+            "origin_stop_id": "ST-H-130",
+            "destination_stop_id": "ST-H-129",
+            "requested_pickup_at": "2030-08-04T13:00:00+09:00",
+            "passenger_count": 1,
+        }]
 
         second = self._create_reservation(
             client_ref="be-contract-call-002",
+            operation_id="be-contract-call-002:create",
             origin="서산버스터미널",
             destination="서산시청",
             requested_pickup_at="2030-08-04T13:30:00+09:00",
+            active_reservations=active,
         )
 
         self.assertEqual(second.status_code, 200)
-        with server.state_lock:
-            after = server.dispatcher.requests[first_id]
-            self.assertEqual(after.assigned_vehicle_id, before.assigned_vehicle_id)
-            self.assertEqual(after.promised_pickup_time, before.promised_pickup_time)
-            self.assertEqual(after.status, RequestStatus.ASSIGNED)
+        self.assertNotEqual(second.json()["plan_id"], first["plan_id"])
+        self.assertEqual(self.client.get("/drt/reservations").json()["count"], 0)
 
 
 if __name__ == "__main__":
