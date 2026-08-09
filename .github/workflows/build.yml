@@ -11,6 +11,7 @@ on:
       - 'dispatch/**'
       - 'requirements.txt'
       - 'Dockerfile'
+      - '.dockerignore'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
