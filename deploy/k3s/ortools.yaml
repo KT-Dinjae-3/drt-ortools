@@ -21,7 +21,7 @@ spec:
         - name: ghcr-pull
       containers:
         - name: ortools
-          image: ghcr.io/kt-dinjae-3/drt-ortools@sha256:0f2da70468a1baff69cb07d808c6e6c779d17626b3e1666317cd243fab314cf2
+          image: ghcr.io/kt-dinjae-3/drt-ortools@sha256:6ccceb60123d86ad38b0df4d3a1752eb2e31e1449d97134f0e761be49536e60e
           imagePullPolicy: IfNotPresent
           ports:
             - { name: http, containerPort: 8092 }
